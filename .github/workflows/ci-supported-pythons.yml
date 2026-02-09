@@ -1,0 +1,93 @@
+---
+name: Use JSON output to build job matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_COLOR: "1" # Make tools pretty.
+
+jobs:
+  build-package:
+    name: Build & verify package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: hynek/structlog
+          path: structlog
+          fetch-depth: 0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: action
+      - uses: ./action
+        id: baipp
+        with:
+          path: structlog
+
+    outputs:
+      package-version: ${{ steps.baipp.outputs.package_version }}
+      python-versions: ${{ steps.baipp.outputs.supported_python_classifiers_json_array }}
+      # If your matrix consists only of Python versions, you can use the
+      # following, too:
+      # python-versions: ${{ steps.baipp.outputs.supported_python_classifiers_json_job_matrix_value }}
+
+  test-supported-pythons:
+    needs: build-package
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Create matrix from the 'python-versions' output from the build-package
+        # job.
+        python-version: ${{ fromJson(needs.build-package.outputs.python-versions) }}
+
+      # If you set 'python-versions' to
+      # 'supported_python_classifiers_json_job_matrix_value'
+      # above, you would set the matrix like this instead:
+      # matrix: ${{ fromJson(needs.build-package.outputs.python-versions) }}
+
+    steps:
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Download built packages from the build-package job.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: Packages
+          path: dist
+
+      - name: Prepare tests & config
+        run: |
+          # We use tox together with the fast tox-uv plugin.
+          python -Im pip install tox-uv
+
+          # Unpack SDist for tests & config files.
+          tar xf dist/*.tar.gz --strip-components=1
+
+          # Ensure tests run against wheel.
+          rm -rf src
+
+      # To conserve CI resources, we've commented the next step out to not
+      # actually run the tests. Just remove the 'echo' to run them.
+      - name: Run tox environments for ${{ matrix.python-version }}
+        run: echo python -Im tox run --installpkg dist/*.whl -f py$(echo ${{ matrix.python-version }} | tr -d .)
+
+  test-package-version:
+    needs: build-package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+
+      - run: |
+          echo "Package version: ${{ needs.build-package.outputs.package-version }}"
+
+...

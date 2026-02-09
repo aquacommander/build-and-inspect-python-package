@@ -1,0 +1,278 @@
+---
+name: Build and Inspect a Python Package
+description: Builds the current package using standard PyPA tooling, keeps it as artifacts, then performs checks on it.
+author: Hynek Schlawack
+branding:
+  icon: package
+  color: purple
+
+inputs:
+  path:
+    description: Where to look for the Python package to inspect.
+    required: false
+    default: .
+  skip-wheel:
+    description: Only build the source distribution.
+    required: false
+    default: 'false'
+  upload-name-suffix:
+    description: Suffix to append to the artifact names.
+    required: false
+    default: ""
+  attest-build-provenance-github:
+    description: "Attest provenance using GitHub's own action. Requires 'attestations: write' and 'id-token: write' permissions."
+    required: false
+    default: 'false'
+outputs:
+  artifact-name:
+    description: The name of the uploaded artifact.
+    value: ${{ steps.artifact.outputs.name }}
+  dist:
+    description: The location of the built packages.
+    value: ${{ steps.dist-location-setter.outputs.dist }}
+  supported_python_classifiers_json_array:
+    description: >
+      A JSON array that contains all classifier-declared supported Python
+      versions. When loaded using the 'fromJson' function, this can be assigned
+      to a matrix strategy key (for example, `python-version`).
+
+    value: ${{ steps.metadata-setter.outputs.supported_python_classifiers_json_array }}
+  supported_python_classifiers_json_job_matrix_value:
+    description: >
+      Same as 'supported_python_classifiers_json_array', except it's already a
+      JSON mapping from "python-version" to a list of all classifier-declared
+      supported Python versions. In other words, you can assign it directly to
+      the 'strategy.matrix' key.
+    value: ${{ steps.metadata-setter.outputs.supported_python_classifiers_json_job_matrix_value }}
+  package_name:
+    description: The name of the package.
+    value: ${{ steps.metadata-setter.outputs.package_name }}
+  package_version:
+    description: The version of the package as declared in the metadata.
+    value: ${{ steps.metadata-setter.outputs.package_version }}
+
+runs:
+  using: composite
+
+  steps:
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      id: python-baipp
+      with:
+        python-version: "3.14"
+        update-environment: false
+
+    - name: Install uv
+      run: >
+        curl
+        --location
+        --silent
+        --show-error
+        --fail
+        --proto '=https'
+        --tlsv1.2
+        https://astral.sh/uv/install.sh | bash
+      shell: bash
+
+    - name: Set uv cache and hash lock file
+      run: |
+        echo "UV_CACHE_DIR=/tmp/baipp-uv_cache_dir" >>$GITHUB_ENV
+
+        echo "REQS_HASH=$(sha256sum ${{ github.action_path }}/requirements/tools.txt | cut -d' ' -f1)" >>$GITHUB_ENV
+      shell: bash
+
+    - name: Setup uv cache
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ${{ env.UV_CACHE_DIR }}
+        key: baipp-${{ env.REQS_HASH }}
+
+    - name: Create venv for tools
+      run: |
+        unset UV_SYSTEM_PYTHON
+        unset UV_PYTHON
+
+        uv venv \
+          /tmp/baipp \
+          --python ${{ steps.python-baipp.outputs.python-path }}
+      shell: bash
+
+    - name: Install our tools
+      run: |
+        unset UV_SYSTEM_PYTHON
+        unset UV_PYTHON
+
+        uv pip sync \
+          ${{ github.action_path }}/requirements/tools.txt
+      shell: bash
+      env:
+        VIRTUAL_ENV: /tmp/baipp
+
+    - name: Artifact Name
+      id: artifact
+      run: echo "name=Packages${{ inputs.upload-name-suffix }}" >>${GITHUB_OUTPUT}
+      shell: bash
+
+    # Build SDist, then build wheel out of it if the user didn't forbid it.
+    # Set 'SOURCE_DATE_EPOCH' based on the last commit for build
+    # reproducibility.
+    - name: Build package
+      run: |
+        unset UV_SYSTEM_PYTHON
+        unset UV_PYTHON
+
+        echo Setting SOURCE_DATE_EPOCH to $(git log -1 --pretty=%ct).
+        export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+
+        if [[ "${{ inputs.skip-wheel }}" == "true" ]]; then
+          uv build --sdist --out-dir /tmp/baipp/dist
+        else
+          uv build --out-dir /tmp/baipp/dist
+        fi
+
+        # We don't need .gitignores and it litters the provenance output.
+        rm -f /tmp/baipp/dist/.gitignore
+      shell: bash
+      working-directory: ${{ inputs.path }}
+
+    - name: Optimize uv cache for CI
+      run: uv cache prune --ci
+      shell: bash
+
+    - name: Attest GitHub build provenance
+      if: ${{ inputs.attest-build-provenance-github == 'true' }}
+      uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8 # v3.1.0
+      with:
+        subject-path: "/tmp/baipp/dist/*"
+
+    - name: Set output
+      id: dist-location-setter
+      shell: bash
+      run: echo "dist=/tmp/baipp/dist" >>$GITHUB_OUTPUT
+
+    # Give user overview over what we've built.
+    - run: ls -l /tmp/baipp/dist
+      shell: bash
+      working-directory: ${{ inputs.path }}
+
+    - name: Upload built artifacts.
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: /tmp/baipp/dist/*
+
+    - name: Check wheel contents if one was built
+      run: |
+        if [[ "${{ inputs.skip-wheel }}" != 'true' ]]; then
+          /tmp/baipp/bin/check-wheel-contents /tmp/baipp/dist/*.whl
+        fi
+      shell: bash
+      working-directory: ${{ inputs.path }}
+
+    - name: Check PyPI README
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: >
+        /tmp/baipp/bin/python
+        -m twine check
+        --strict
+        /tmp/baipp/dist/*
+
+    - name: Extract built package
+      working-directory: ${{ inputs.path }}
+      shell: bash
+      run: |
+        cd /tmp/baipp/dist
+        mkdir -p out/sdist
+        tar xf *.tar.gz -C out/sdist
+
+        if [[ "${{ inputs.skip-wheel }}" != 'true' ]]; then
+            mkdir -p out/wheels
+            /tmp/baipp/bin/python -m wheel unpack --dest out/wheels *.whl
+        fi
+
+    - name: Extract packaging metadata
+      id: metadata-setter
+      shell: bash
+      working-directory: /tmp/baipp/dist/out/sdist/
+      run: |
+          cat */PKG-INFO | python -c '
+          import email.parser
+          import json, pathlib, re, sys
+
+          pkg_info = email.parser.Parser().parsestr(sys.stdin.read())
+
+          version_tokens = []
+          for classifier in pkg_info.get_all("Classifier", []):
+              if match := re.match(r"Programming Language :: Python :: (\d+\.\d+)$", classifier):
+                  version_tokens.append(match.group(1))
+
+          package_name = pkg_info.get("Name")
+          if package_name is None:
+              raise RuntimeError("Package name is not set")
+
+          pathlib.Path("package_name.txt").write_text(package_name)
+
+          package_version = pkg_info.get("Version", "0.0.0")
+
+          print(f"package_name={package_name}")
+          print(f"package_version={package_version}")
+          print(f"supported_python_classifiers_json_array={json.dumps(version_tokens)}")
+          print(f"""supported_python_classifiers_json_job_matrix_value={json.dumps({"python-version": version_tokens})}""")
+          ' >> $GITHUB_OUTPUT
+
+          echo -e "\n### Contents of the <code>$(cat package_name.txt)</code> package" >> $GITHUB_STEP_SUMMARY
+          rm -f package_name.txt
+
+
+    - name: Show package contents hierarchically, including metadata.
+      working-directory: /tmp/baipp/dist/out/sdist/
+      shell: bash
+      run: |
+        if ! command -v tree &> /dev/null; then
+            sudo apt-get install tree
+        fi
+
+        echo -e '\n<details><summary>SDist contents</summary>\n' >> $GITHUB_STEP_SUMMARY
+        tree -Da --timefmt="%Y-%m-%dT%H:%M:%SZ" * | sed 's/^/    /' | tee -a $GITHUB_STEP_SUMMARY
+        echo -e '\n</details>\n' >> $GITHUB_STEP_SUMMARY
+
+        if [ -d "../wheels" ]; then
+            echo -e '\n<details><summary>Wheel contents</summary>\n' >> $GITHUB_STEP_SUMMARY
+            (cd ../wheels && tree -a * | sed 's/^/    /' | tee -a $GITHUB_STEP_SUMMARY)
+            echo -e '\n</details>\n' >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo ----- Metadata Follows -----
+        echo -e '\n<details><summary>Metadata</summary>\n' >> $GITHUB_STEP_SUMMARY
+        cat */PKG-INFO | sed 's/^/    /' | tee -a $GITHUB_STEP_SUMMARY
+        echo -e '\n</details>\n' >> $GITHUB_STEP_SUMMARY
+        echo ----- End of Metadata  -----
+
+    - name: Upload metadata
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        name: Package Metadata${{ inputs.upload-name-suffix }}
+        path: /tmp/baipp/dist/out/sdist/*/PKG-INFO
+
+    - name: Extract PyPI README
+      shell: bash
+      working-directory: /tmp/baipp/dist/out/sdist/
+      run: |
+        cat */PKG-INFO | python -c '
+        import email.parser
+        import sys
+
+        em = email.parser.Parser().parsestr(sys.stdin.read())
+        suffix = {
+            "text/markdown": "md",
+            "text/x-rst": "rst",
+        }[em["Description-Content-Type"]]
+        with open(f"PyPI-README.{suffix}", "w") as f:
+            f.write(em.get_payload())
+        '
+
+    - name: Upload PyPI README
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        name: PyPI README${{ inputs.upload-name-suffix }}
+        path: /tmp/baipp/dist/out/sdist/PyPI-README.*
