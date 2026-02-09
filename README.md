@@ -7,7 +7,7 @@
 *build-and-inspect-python-package* is a GitHub Action that provides the following functionality to Python package maintainers:
 
 **Builds your package**[^backend].
-[`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/specs/source-date-epoch/) is set to the timestamp of the last commit, giving you reproducible builds with meaningful file timestamps.
+
 
 [^backend]: Works with any [PEP 517](https://peps.python.org/pep-0517/)-compatible build backend. This includes Hatchling, Flit, Setuptools, PDM, and Poetry.
 
